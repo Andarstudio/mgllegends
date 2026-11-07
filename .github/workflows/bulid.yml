@@ -50,9 +50,7 @@ jobs:
       - name: Repack into LombardOS image
         run: |
           IMG=$(find gsi -name system.img | head -n1)
-          mkdir -p LombardOS/output
-          sudo bash LombardOS/scripts/repack-gsi.sh "$IMG" "${{ inputs.apk_path }}" LombardOS/output
-          cd LombardOS/output
+          sudo bash repack-gsi.sh "$IMG" "${{ inputs.apk_path }}"
           zip lombardos-system.img.zip lombardos-system.img lombardos-system.img.sha256
           ls -lh
 
