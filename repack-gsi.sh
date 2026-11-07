@@ -8,7 +8,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IN="$(realpath "$1")"; APK="$(realpath "$2")"; OUT="$(realpath -m "${3:-$ROOT/output}")"
-XML="$ROOT/../privapp-permissions-com.lombardos.setup.xml"
+XML="$(mktemp)"; printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<permissions>' '  <privapp-permissions package="com.lombardos.setup">' '    <permission name="android.permission.WRITE_SECURE_SETTINGS"/>' '    <permission name="android.permission.CHANGE_COMPONENT_ENABLED_STATE"/>' '  </privapp-permissions>' '</permissions>' > "$XML"
 GROW_MB=256
 
 for t in simg2img img2simg e2fsck resize2fs truncate setfattr file mount; do
