@@ -26,10 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check APK exists
+      - name: Check files exist
         run: |
-          test -f "${{ inputs.apk_path }}" || { echo "APK not found. Commit it with: git add -f <path>"; exit 1; }
-          ls -l "${{ inputs.apk_path }}"
+          test -f "${{ inputs.apk_path }}" || { echo "APK not found: ${{ inputs.apk_path }}"; exit 1; }
+          test -f repack-gsi.sh || { echo "repack-gsi.sh not found in repo root"; exit 1; }
+          ls -l "${{ inputs.apk_path }}" repack-gsi.sh
 
       - name: Free disk space
         run: |
@@ -50,7 +51,9 @@ jobs:
       - name: Repack into LombardOS image
         run: |
           IMG=$(find gsi -name system.img | head -n1)
-          sudo bash repack-gsi.sh "$IMG" "${{ inputs.apk_path }}"
+          mkdir -p out
+          sudo bash repack-gsi.sh "$IMG" "${{ inputs.apk_path }}" "$PWD/out"
+          cd out
           zip lombardos-system.img.zip lombardos-system.img lombardos-system.img.sha256
           ls -lh
 
@@ -59,7 +62,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "img-${{ github.run_number }}" \
-            LombardOS/output/lombardos-system.img.zip \
+            out/lombardos-system.img.zip \
             --draft --prerelease \
             --title "LombardOS image ${{ github.run_number }} (not boot-tested)" \
             --notes "Stock Android 14 GSI + LombardSetup + Mongolian locale. NOT boot-tested. Draft on purpose: contains Google's GSI, do not publish."
