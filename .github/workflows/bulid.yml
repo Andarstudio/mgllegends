@@ -1,0 +1,67 @@
+name: Build LombardOS image (from existing APK)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_path:
+        description: "Path to the committed APK"
+        required: true
+        default: "LombardOS/output/LombardSetup-debug.apk"
+      gsi_url:
+        description: "Stock Android 14 ARM64 GSI zip URL"
+        required: true
+        default: "https://dl.google.com/developers/android/udc/images/gsi/aosp_arm64-exp-UQ1A.231205.015-11084887-e291b838.zip"
+      gsi_sha256:
+        description: "Expected SHA-256 of that zip"
+        required: true
+        default: "e291b838f9e2786eb44c952ca25469745c8085cf91611397d7f620136b48c086"
+
+permissions:
+  contents: write
+
+jobs:
+  build-img:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check APK exists
+        run: |
+          test -f "${{ inputs.apk_path }}" || { echo "APK not found. Commit it with: git add -f <path>"; exit 1; }
+          ls -l "${{ inputs.apk_path }}"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Install repack tools
+        run: sudo apt-get update && sudo apt-get install -y android-sdk-libsparse-utils e2fsprogs attr file zip
+
+      - name: Download and verify stock GSI
+        run: |
+          wget -q -O gsi.zip "${{ inputs.gsi_url }}"
+          echo "${{ inputs.gsi_sha256 }}  gsi.zip" | sha256sum -c -
+          unzip -q gsi.zip -d gsi
+          rm gsi.zip
+          find gsi -name system.img
+
+      - name: Repack into LombardOS image
+        run: |
+          IMG=$(find gsi -name system.img | head -n1)
+          mkdir -p LombardOS/output
+          sudo bash LombardOS/scripts/repack-gsi.sh "$IMG" "${{ inputs.apk_path }}" LombardOS/output
+          cd LombardOS/output
+          zip lombardos-system.img.zip lombardos-system.img lombardos-system.img.sha256
+          ls -lh
+
+      - name: Draft release with the image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "img-${{ github.run_number }}" \
+            LombardOS/output/lombardos-system.img.zip \
+            --draft --prerelease \
+            --title "LombardOS image ${{ github.run_number }} (not boot-tested)" \
+            --notes "Stock Android 14 GSI + LombardSetup + Mongolian locale. NOT boot-tested. Draft on purpose: contains Google's GSI, do not publish."
