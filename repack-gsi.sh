@@ -25,6 +25,10 @@ for tool in simg2img img2simg e2fsck resize2fs truncate setfattr file mount umou
   }
 done
 [[ -f "$APK" ]] || { echo "APK not found: $APK" >&2; exit 1; }
+[[ -f "$ROOT/privapp-permissions-com.lombardos.setup.xml" ]] || {
+  echo "Privileged permission XML not found in repository root." >&2
+  exit 1
+}
 
 WORK="$(mktemp -d)"
 MNT="$WORK/mnt"
@@ -51,17 +55,12 @@ file "$RAW" | grep -Eqi 'ext[234]' || {
 }
 
 echo "[2/7] Expanding image and filesystem before unsharing blocks"
-# Android GSIs can use ext4 shared_blocks. e2fsck's unshare_blocks option
-# needs free blocks to clone shared extents. Grow BOTH the container and
-# filesystem first; otherwise it can exhaust the original full filesystem.
+# e2fsck's unshare_blocks option needs free blocks to clone shared extents.
+# Grow the container and filesystem first, or a full GSI runs out of blocks.
 truncate -s "+${GROW_MB}M" "$RAW"
 resize2fs "$RAW"
 
 echo "[3/7] Unsharing ext4 blocks and checking filesystem"
-e2fsck -f -y -E unshare_blocks "$RAW"
-# e2fsck returns 1 when it corrected the filesystem; set -e handles only
-# uncorrected/fatal errors as a failure, while status 1 is an expected repair.
-# (Capture explicitly so a status >1 cannot be hidden.)
 set +e
 e2fsck -f -y -E unshare_blocks "$RAW"
 FSCK_STATUS=$?
@@ -115,7 +114,6 @@ fi
 echo "[7/7] Unmounting, checking and writing output"
 sync
 umount "$MNT"
-# Final read-only filesystem check: do not package an image that still has errors.
 e2fsck -f -n "$RAW"
 img2simg "$RAW" "$OUT/lombardos-system.img"
 (
