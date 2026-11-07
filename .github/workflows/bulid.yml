@@ -6,7 +6,7 @@ on:
       apk_path:
         description: "Path to the committed APK"
         required: true
-        default: "LombardOS/output/LombardSetup-debug.apk"
+        default: "LombardSetup-debug.apk"
       gsi_url:
         description: "Stock Android 14 ARM64 GSI zip URL"
         required: true
