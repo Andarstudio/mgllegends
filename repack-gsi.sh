@@ -1,61 +1,125 @@
 #!/usr/bin/env bash
-# Repack a stock Android 14 GSI system.img into a LombardOS GSI. No AOSP build needed.
-# UNTESTED: written without access to a real GSI. Run it and report any error.
-set -euo pipefail
+# Repack a stock Android 14 GSI system.img into a LombardOS GSI.
+# This modifies the system partition image only; it is not a full AOSP build.
+set -Eeuo pipefail
 
-[ $# -ge 2 ] || { echo "Usage: sudo $0 <stock-system.img> <LombardSetup.apk> [out-dir]"; exit 1; }
-[ "$(id -u)" = 0 ] || { echo "Run with sudo: mounting the image needs a loop device."; exit 1; }
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "Usage: sudo $0 <stock-system.img> <LombardSetup.apk> [out-dir]" >&2
+  exit 2
+fi
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Run with sudo: mounting the image requires root." >&2
+  exit 1
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-IN="$(realpath "$1")"; APK="$(realpath "$2")"; OUT="$(realpath -m "${3:-$ROOT/output}")"
-XML="$(mktemp)"; printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<permissions>' '  <privapp-permissions package="com.lombardos.setup">' '    <permission name="android.permission.WRITE_SECURE_SETTINGS"/>' '    <permission name="android.permission.CHANGE_COMPONENT_ENABLED_STATE"/>' '  </privapp-permissions>' '</permissions>' > "$XML"
-GROW_MB=256
+IN="$(realpath "$1")"
+APK="$(realpath "$2")"
+OUT="$(realpath -m "${3:-$ROOT/output}")"
+GROW_MB="${GROW_MB:-1024}"
 
-for t in simg2img img2simg e2fsck resize2fs truncate setfattr file mount; do
-  command -v "$t" >/dev/null || { echo "Missing tool: $t (Ubuntu: apt install android-sdk-libsparse-utils e2fsprogs attr)"; exit 1; }
+for tool in simg2img img2simg e2fsck resize2fs truncate setfattr file mount umount install sha256sum; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "Missing required tool: $tool (Ubuntu: android-sdk-libsparse-utils e2fsprogs attr)" >&2
+    exit 1
+  }
 done
-[ -f "$APK" ] && [ -f "$XML" ] || { echo "APK or permissions XML not found"; exit 1; }
+[[ -f "$APK" ]] || { echo "APK not found: $APK" >&2; exit 1; }
 
-WORK="$(mktemp -d)"; MNT="$WORK/mnt"; RAW="$WORK/raw.img"; mkdir -p "$MNT" "$OUT"
-cleanup(){ mountpoint -q "$MNT" && umount "$MNT" || true; rm -rf "$WORK"; }
+WORK="$(mktemp -d)"
+MNT="$WORK/mnt"
+RAW="$WORK/raw.img"
+mkdir -p "$MNT" "$OUT"
+
+cleanup() {
+  mountpoint -q "$MNT" && umount "$MNT" || true
+  rm -rf "$WORK"
+}
 trap cleanup EXIT
 
-echo "[1/7] Converting to raw"
-if file "$IN" | grep -qi "sparse"; then simg2img "$IN" "$RAW"; else cp "$IN" "$RAW"; fi
-file "$RAW" | grep -Eqi "ext[234]" || { echo "Not ext4 (maybe EROFS). Unsupported by this script."; file "$RAW"; exit 1; }
+echo "[1/7] Converting GSI to raw image"
+if file "$IN" | grep -qi sparse; then
+  simg2img "$IN" "$RAW"
+else
+  cp --reflink=auto "$IN" "$RAW"
+fi
 
-echo "[2/7] Unsharing blocks and growing image by ${GROW_MB} MB"
-e2fsck -fy -E unshare_blocks "$RAW" || [ $? -le 1 ]
-truncate -s +${GROW_MB}M "$RAW"
-e2fsck -fy "$RAW" || [ $? -le 1 ]
+file "$RAW" | grep -Eqi 'ext[234]' || {
+  echo "The system image is not ext2/3/4. This script cannot modify EROFS images." >&2
+  file "$RAW"
+  exit 1
+}
+
+echo "[2/7] Expanding image and filesystem before unsharing blocks"
+# Android GSIs can use ext4 shared_blocks. e2fsck's unshare_blocks option
+# needs free blocks to clone shared extents. Grow BOTH the container and
+# filesystem first; otherwise it can exhaust the original full filesystem.
+truncate -s "+${GROW_MB}M" "$RAW"
 resize2fs "$RAW"
 
-echo "[3/7] Mounting"
-mount -o loop,rw "$RAW" "$MNT" || { echo "Loop mount failed. Codespaces often blocks loop devices; use a Linux VM or PC."; exit 1; }
-if [ -d "$MNT/system/system_ext" ]; then SYS="$MNT/system"; else SYS="$MNT"; fi
-[ -d "$SYS/system_ext" ] || { echo "Cannot find system_ext in image"; ls "$MNT"; exit 1; }
+echo "[3/7] Unsharing ext4 blocks and checking filesystem"
+e2fsck -f -y -E unshare_blocks "$RAW"
+# e2fsck returns 1 when it corrected the filesystem; set -e handles only
+# uncorrected/fatal errors as a failure, while status 1 is an expected repair.
+# (Capture explicitly so a status >1 cannot be hidden.)
+set +e
+e2fsck -f -y -E unshare_blocks "$RAW"
+FSCK_STATUS=$?
+set -e
+if [[ "$FSCK_STATUS" -gt 1 ]]; then
+  echo "e2fsck failed while unsharing blocks (exit $FSCK_STATUS)." >&2
+  exit "$FSCK_STATUS"
+fi
+resize2fs "$RAW"
+
+echo "[4/7] Mounting expanded system image"
+mount -o loop,rw "$RAW" "$MNT" || {
+  echo "Could not mount the expanded image. Check that this runner supports loop devices." >&2
+  exit 1
+}
+if [[ -d "$MNT/system/system_ext" ]]; then
+  SYS="$MNT/system"
+else
+  SYS="$MNT"
+fi
+[[ -d "$SYS/system_ext" ]] || {
+  echo "Could not locate system_ext in the mounted system image." >&2
+  ls -la "$MNT"
+  exit 1
+}
 SE="$SYS/system_ext"
-echo "system root: $SYS"
 
-label(){ setfattr -n security.selinux -v u:object_r:system_file:s0 "$1" 2>/dev/null || echo "WARN: could not set SELinux label on $1"; }
+label() {
+  setfattr -n security.selinux -v u:object_r:system_file:s0 "$1" 2>/dev/null ||
+    echo "Warning: could not set SELinux label on $1"
+}
 
-echo "[4/7] Installing LombardSetup as privileged app"
-rm -rf "$SE/priv-app/Provision" "$SYS/priv-app/Provision"   # default AOSP first-boot app, replaced by LombardSetup
+echo "[5/7] Installing LombardSetup as a privileged app"
+rm -rf "$SE/priv-app/Provision" "$SYS/priv-app/Provision"
 install -d -m 0755 "$SE/priv-app/LombardSetup" "$SE/etc/permissions"
 install -m 0644 "$APK" "$SE/priv-app/LombardSetup/LombardSetup.apk"
-install -m 0644 "$XML" "$SE/etc/permissions/privapp-permissions-com.lombardos.setup.xml"
-label "$SE/priv-app/LombardSetup"; label "$SE/priv-app/LombardSetup/LombardSetup.apk"
+install -m 0644 "$ROOT/privapp-permissions-com.lombardos.setup.xml" "$SE/etc/permissions/privapp-permissions-com.lombardos.setup.xml"
+label "$SE/priv-app/LombardSetup"
+label "$SE/priv-app/LombardSetup/LombardSetup.apk"
 label "$SE/etc/permissions/privapp-permissions-com.lombardos.setup.xml"
 
-echo "[5/7] Setting Mongolian default locale"
-BP="$SYS/build.prop"; [ -f "$BP" ] || { echo "build.prop not found at $BP"; exit 1; }
-if grep -q '^ro.product.locale=' "$BP"; then sed -i 's/^ro.product.locale=.*/ro.product.locale=mn-MN/' "$BP"
-else printf '\nro.product.locale=mn-MN\n' >> "$BP"; fi
+echo "[6/7] Setting Mongolian default locale"
+BP="$SYS/build.prop"
+[[ -f "$BP" ]] || { echo "build.prop not found at $BP" >&2; exit 1; }
+if grep -q '^ro.product.locale=' "$BP"; then
+  sed -i 's/^ro.product.locale=.*/ro.product.locale=mn-MN/' "$BP"
+else
+  printf '\nro.product.locale=mn-MN\n' >> "$BP"
+fi
 
-echo "[6/7] Unmounting and checking"
-sync; umount "$MNT"; e2fsck -fy "$RAW" || [ $? -le 1 ]
-
-echo "[7/7] Writing output"
+echo "[7/7] Unmounting, checking and writing output"
+sync
+umount "$MNT"
+# Final read-only filesystem check: do not package an image that still has errors.
+e2fsck -f -n "$RAW"
 img2simg "$RAW" "$OUT/lombardos-system.img"
-( cd "$OUT" && sha256sum lombardos-system.img | tee lombardos-system.img.sha256 )
+(
+  cd "$OUT"
+  sha256sum lombardos-system.img | tee lombardos-system.img.sha256
+)
 echo "Done: $OUT/lombardos-system.img (NOT boot-tested)"
